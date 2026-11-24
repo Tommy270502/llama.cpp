@@ -261,6 +261,141 @@ static void mul_mat_vec_q_reorder_ncols(const void * __restrict__ vx, const void
     }
 }
 
+// Reordered IQ4_NL / IQ4_XS mat-vec that decodes the codes through the SLM tables of iq4nl_codes_to_int8_slm.
+// Each work-group fills the tables once and walks rows until the matrix is done; a sub-group takes rows_per_sg
+// rows per step, which reuses each activation load for all of them. With has_fusion, vgate is the gate weight
+// of the same type and layout, and the epilogue writes glu(gate, up).
+template <ggml_type type, int ncols_dst, int rows_per_sg, bool has_fusion>
+static void mul_mat_vec_q_reorder_iq4_slm(const void * __restrict__ vx, const void * __restrict__ vgate,
+                                          const void * __restrict__ vy, float * __restrict__ dst, const int ncols,
+                                          const int nrows, const int stride_col_y_bytes, const int stride_col_dst,
+                                          const ggml_glu_op glu_op, uint32_t * table,
+                                          const sycl::nd_item<3> & nd_item) {
+    using vec_dot      = reorder_vec_dot_q_sycl<type>;
+    using block_type   = ggml_sycl_reordered::block_q_t<type>;
+    using block_traits = typename block_type::traits;
+
+    iq4nl_slm_table_fill(table, nd_item.get_local_linear_id(), nd_item.get_local_range().size());
+    sycl::group_barrier(nd_item.get_group());
+
+    const auto sg       = nd_item.get_sub_group();
+    const int  lane     = sg.get_local_linear_id();
+    const int  sg_index = nd_item.get_group_linear_id() * sg.get_group_linear_range() + sg.get_group_linear_id();
+    const int  sg_count = nd_item.get_group_range().size() * sg.get_group_linear_range();
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    const int     nblocks                     = nrows * blocks_per_row;
+    const int     iqs                         = block_traits::vdr_mmvq * (lane % block_elements_per_subgroup);
+
+    static_assert(block_elements_per_subgroup <= WARP_SIZE);
+
+    // row0 is sub-group uniform, so the collectives below stay convergent
+    for (int row0 = sg_index * rows_per_sg; row0 < nrows; row0 += sg_count * rows_per_sg) {
+        float partial_sum[ncols_dst][rows_per_sg] = {};
+        [[maybe_unused]] float partial_gate[has_fusion ? ncols_dst : 1][has_fusion ? rows_per_sg : 1] = {};
+
+        for (int i = lane / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+            const int iby = i * block_type::block_to_q8_1_ratio();
+
+            typename vec_dot::weights wx[rows_per_sg];
+            [[maybe_unused]] typename vec_dot::weights wg[has_fusion ? rows_per_sg : 1];
+#pragma unroll
+            for (int r = 0; r < rows_per_sg; ++r) {
+                const int  ibx       = sycl::min(row0 + r, nrows - 1) * blocks_per_row + i;
+                const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+                const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+                wx[r] = vec_dot::load(vx, bx_offset, d_offset, iqs, table);
+                if constexpr (has_fusion) {
+                    wg[r] = vec_dot::load(vgate, bx_offset, d_offset, iqs, table);
+                }
+            }
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const char * vy_j = (const char *) vy + j * stride_col_y_bytes;
+                const auto   a    = vec_dot::load_activations(
+                    (const int8_t *) vy_j + iby * QK8_1, (const sycl::half2 *) (vy_j + ncols + iby * sizeof(sycl::half2)),
+                    iqs);
+#pragma unroll
+                for (int r = 0; r < rows_per_sg; ++r) {
+                    partial_sum[j][r] += vec_dot::apply(wx[r], a);
+                    if constexpr (has_fusion) {
+                        partial_gate[j][r] += vec_dot::apply(wg[r], a);
+                    }
+                }
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int r = 0; r < rows_per_sg; ++r) {
+                float sum = sycl::reduce_over_group(sg, partial_sum[j][r], std::plus<>());
+                if constexpr (has_fusion) {
+                    const float gate = sycl::reduce_over_group(sg, partial_gate[j][r], std::plus<>());
+                    sum *= glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate) : op_gelu(gate);
+                }
+                if (sg.leader() && row0 + r < nrows) {
+                    dst[j * stride_col_dst + row0 + r] = sum;
+                }
+            }
+        }
+    }
+}
+
+// The tables take 33 KiB of SLM, so a work-group of 32 sub-groups shares them and two work-groups fill an Xe2
+// core. More work-groups than that make a second, partial wave and are slower.
+template <ggml_type type, int ncols_dst, bool has_fusion>
+static void launch_mul_mat_vec_q_reorder_iq4_slm(const void * vx, const void * vgate, const void * vy, float * dst,
+                                                 const int ncols, const int nrows, const int stride_col_y_bytes,
+                                                 const int stride_col_dst, const ggml_glu_op glu_op,
+                                                 dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % ggml_sycl_reordered::block_q_t<type>::traits::qk == 0);
+
+    constexpr int rows_per_sg   = ncols_dst == 1 || has_fusion ? 2 : 4;
+    constexpr int num_subgroups = 32;
+
+    int device;
+    SYCL_CHECK(CHECK_TRY_ERROR(device = get_current_device_id()));
+    // nsm counts an Xe core as 16 EUs, an Xe2 core has 8
+    const int xe_cores = std::max(1, ggml_sycl_info().devices[device].nsm * 2);
+    const int n_wg     = std::min(2 * xe_cores, (int) ceil_div(nrows, num_subgroups * rows_per_sg));
+
+    const sycl::range<3> block_dims(1, 1, num_subgroups * WARP_SIZE);
+    const sycl::range<3> block_nums(1, 1, n_wg);
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<uint32_t, 1> table(sycl::range<1>(IQ4NL_SLM_TABLE_SIZE), cgh);
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q_reorder_iq4_slm<type, ncols_dst, rows_per_sg, has_fusion>(
+                                 vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op,
+                                 table.get_multi_ptr<sycl::access::decorated::no>().get(), nd_item);
+                         });
+    });
+}
+
+template <ggml_type type, bool has_fusion>
+static bool mul_mat_vec_q_reorder_iq4_slm_switch_ncols(const void * vx, const void * vgate, const void * vy,
+                                                       float * dst, const int ncols, const int nrows,
+                                                       const int ncols_dst, const int stride_col_y_bytes,
+                                                       const int stride_col_dst, const ggml_glu_op glu_op,
+                                                       dpct::queue_ptr stream) {
+    switch (ncols_dst) {
+        case 1: launch_mul_mat_vec_q_reorder_iq4_slm<type, 1, has_fusion>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 2: launch_mul_mat_vec_q_reorder_iq4_slm<type, 2, has_fusion>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 3: launch_mul_mat_vec_q_reorder_iq4_slm<type, 3, has_fusion>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 4: launch_mul_mat_vec_q_reorder_iq4_slm<type, 4, has_fusion>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 5: launch_mul_mat_vec_q_reorder_iq4_slm<type, 5, has_fusion>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 6: launch_mul_mat_vec_q_reorder_iq4_slm<type, 6, has_fusion>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 7: launch_mul_mat_vec_q_reorder_iq4_slm<type, 7, has_fusion>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 8: launch_mul_mat_vec_q_reorder_iq4_slm<type, 8, has_fusion>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        default: return false;
+    }
+}
+
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
 static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
                           const int ncols, const int nrows, const sycl::nd_item<3> & item_ct1) {
@@ -2565,13 +2700,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_IQ4_NL:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                    if (i == 0 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reordered IQ4_NL multi-col MMVQ ncols=%d\n", (int) src1_ncols);
-                        reorder_mul_mat_vec_iq_q8_1_sycl_switch_ncols<GGML_TYPE_IQ4_NL>(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
+                        GGML_SYCL_DEBUG("Calling reordered IQ4_NL SLM-table MMVQ ncols=%d\n", (int) src1_ncols);
+                        mul_mat_vec_q_reorder_iq4_slm_switch_ncols<GGML_TYPE_IQ4_NL, false>(
+                            src0_dd_i, nullptr, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, stride_col_y_bytes,
+                            stride_col_dst, GGML_GLU_OP_SWIGLU, stream);
                         return;
                     } else {
                         GGML_SYCL_DEBUG("Calling reordered IQ4_NL MMVQ\n");
@@ -2585,13 +2720,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_IQ4_XS:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                    if (i == 0 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
-                        GGML_SYCL_DEBUG("Calling reordered IQ4_XS multi-col MMVQ ncols=%d\n", (int) src1_ncols);
-                        reorder_mul_mat_vec_iq_q8_1_sycl_switch_ncols<GGML_TYPE_IQ4_XS>(
-                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
+                        GGML_SYCL_DEBUG("Calling reordered IQ4_XS SLM-table MMVQ ncols=%d\n", (int) src1_ncols);
+                        mul_mat_vec_q_reorder_iq4_slm_switch_ncols<GGML_TYPE_IQ4_XS, false>(
+                            src0_dd_i, nullptr, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, stride_col_y_bytes,
+                            stride_col_dst, GGML_GLU_OP_SWIGLU, stream);
                         return;
                     } else {
                         GGML_SYCL_DEBUG("Calling reordered IQ4_XS MMVQ\n");
@@ -3337,6 +3472,9 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
             // fusion declines q5_K past 5 columns
             return mul_mat_vec_q_glu_reorder_ncols<GGML_TYPE_Q5_K, 1, 2, 3, 4, 5>(
                 glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, stream);
+        case GGML_TYPE_IQ4_XS:
+            return mul_mat_vec_q_reorder_iq4_slm_switch_ncols<GGML_TYPE_IQ4_XS, true>(
+                vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, glu_op, stream);
         default:
             return false;
     }

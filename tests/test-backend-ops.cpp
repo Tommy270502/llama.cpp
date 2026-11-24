@@ -15074,6 +15074,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // IQ4 mat-vec with persistent work-groups: an odd row tail, and enough rows for several rows per sub-group.
+    for (int64_t rows : {33, 6001}) {
+        for (int64_t m_batch : {1, 2, 3, 4, 8}) {
+            for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+                test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_IQ4_XS, glu_op, m_batch, rows, 512,
+                    false, 1, 1, false, false, true, false, { 1, 1 }));
+            }
+            for (ggml_type type : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, rows, m_batch, 512, {1, 1}, {1, 1},
+                    {0, 1, 2, 3}, 0, 1, false, 0, 0, 0, true));
+            }
+        }
+    }
+
     // Fused gate/up + GLU on the MMQ path, only used if its tiling is efficient: ~1280 tiles per case, one case per type and GLU op.
     test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,        17, 81920, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
     test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_Q5_K,   GGML_GLU_OP_GEGLU,        150, 40960, 256, false, 1, 1, false, false, true, false, { 1, 1 }));

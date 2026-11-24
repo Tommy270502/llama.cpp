@@ -164,11 +164,12 @@ static __dpct_inline__ int mxfp4_codes_to_int8(const uint32_t x) {
     return (int) ((mag ^ (neg * 0xffu)) + neg);
 }
 
+// kvalues_iq4nl as a constexpr, so device code folds it into immediates
+static constexpr int8_t iq4nl_kv[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+
 // Four IQ4_NL codes (bits 0..3 of each byte) to their kvalues_iq4nl int8 values, as a mux tree over the
 // code bits in registers. On Intel GPUs the table lookups of get_int_from_table_16 are byte gathers.
 static __dpct_inline__ int iq4nl_codes_to_int8(const uint32_t x) {
-    constexpr int8_t kv[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
-
     uint32_t m[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -179,7 +180,7 @@ static __dpct_inline__ int iq4nl_codes_to_int8(const uint32_t x) {
     uint32_t v[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-        v[i] = (uint32_t) (uint8_t) kv[i] * 0x01010101u;
+        v[i] = (uint32_t) (uint8_t) iq4nl_kv[i] * 0x01010101u;
     }
 
 #pragma unroll
@@ -190,6 +191,43 @@ static __dpct_inline__ int iq4nl_codes_to_int8(const uint32_t x) {
         }
     }
     return (int) v[0];
+}
+
+// IQ4_NL decode through tables in SLM. The mux tree above is ALU bound on Xe2 and one SLM read per code byte
+// saturates the load unit, so each read takes 12 code bits and returns 3 int8 values already in their output
+// bytes: 8 codes in 3 reads. Tables: [0, 4096) bits 0..11, [4096, 8192) bits 12..23, [8192, 8448) bits 24..31.
+static constexpr int IQ4NL_SLM_TABLE_SIZE = 2 * 4096 + 256;
+
+static __dpct_inline__ uint32_t iq4nl_kvu(const int code) {
+    return (uint32_t) (uint8_t) iq4nl_kv[code];
+}
+
+// work-item id of n fills its share of the tables; the caller then waits on a work-group barrier
+static __dpct_inline__ void iq4nl_slm_table_fill(uint32_t * table, const int id, const int n) {
+    for (int e = id; e < IQ4NL_SLM_TABLE_SIZE; e += n) {
+        // f holds the code nibbles in bit order; lo gets codes 0, 2, 4, 6 and hi gets codes 1, 3, 5, 7
+        uint32_t v;
+        if (e < 4096) {
+            const int f = e;  // codes 0, 1, 2 -> lo byte 0, hi byte 0, lo byte 1
+            v = iq4nl_kvu(f & 15) | iq4nl_kvu((f >> 8) & 15) << 8 | iq4nl_kvu((f >> 4) & 15) << 16;
+        } else if (e < 8192) {
+            const int f = e - 4096;  // codes 3, 4, 5 -> hi byte 1, lo byte 2, hi byte 2
+            v = iq4nl_kvu(f & 15) << 8 | iq4nl_kvu((f >> 8) & 15) << 16 | iq4nl_kvu((f >> 4) & 15) << 24;
+        } else {
+            const int f = e - 8192;  // codes 6, 7 -> lo byte 3, hi byte 3
+            v = iq4nl_kvu(f & 15) << 16 | iq4nl_kvu(f >> 4) << 24;
+        }
+        table[e] = v;
+    }
+}
+
+// Eight IQ4_NL codes of x to int8 values: lo from the low nibbles, hi from the high nibbles of each byte.
+static __dpct_inline__ void iq4nl_codes_to_int8_slm(const uint32_t * table, const uint32_t x, int & lo, int & hi) {
+    const uint32_t a = table[x & 0xfff];
+    const uint32_t b = table[4096 + ((x >> 12) & 0xfff)];
+    const uint32_t c = table[8192 + (x >> 24)];
+    lo = (int) ((a & 0xffffu) | ((b >> 8) & 0x00ff0000u) | ((c << 8) & 0xff000000u));
+    hi = (int) ((a >> 16) | (b & 0x00ffff00u) | (c & 0xff000000u));
 }
 
 // Same result as get_int_from_table_16(q4, kvalues_mxfp4): x = low nibbles, y = high nibbles.
@@ -2016,6 +2054,45 @@ struct reorder_vec_dot_iq4_32 {
         return w;
     }
 
+    static __dpct_inline__ weights decode(const uint8_t * qs, const float d, const uint32_t * table) {
+        const sycl::int4 q4 = *reinterpret_cast<const sycl::int4 *>(qs);
+
+        weights w;
+        iq4nl_codes_to_int8_slm(table, (uint32_t) q4.x(), w.v[0], w.v[4]);
+        iq4nl_codes_to_int8_slm(table, (uint32_t) q4.y(), w.v[1], w.v[5]);
+        iq4nl_codes_to_int8_slm(table, (uint32_t) q4.z(), w.v[2], w.v[6]);
+        iq4nl_codes_to_int8_slm(table, (uint32_t) q4.w(), w.v[3], w.v[7]);
+        w.d = d;
+        return w;
+    }
+
+    // the q8_1 block of a lane, loaded once and applied to several rows
+    struct activations {
+        sycl::int4 u[2];
+        float      d8;
+    };
+
+    static __dpct_inline__ activations load_activations32(const int8_t * q8, const sycl::half2 ds8) {
+        activations a;
+        a.u[0] = *reinterpret_cast<const sycl::int4 *>(q8);
+        a.u[1] = *reinterpret_cast<const sycl::int4 *>(q8 + 16);
+        a.d8   = ds8[0];
+        return a;
+    }
+
+    static __dpct_inline__ float apply(const weights & w, const activations & a) {
+        int sumi = 0;
+        sumi = dpct::dp4a(w.v[0], a.u[0].x(), sumi);
+        sumi = dpct::dp4a(w.v[1], a.u[0].y(), sumi);
+        sumi = dpct::dp4a(w.v[2], a.u[0].z(), sumi);
+        sumi = dpct::dp4a(w.v[3], a.u[0].w(), sumi);
+        sumi = dpct::dp4a(w.v[4], a.u[1].x(), sumi);
+        sumi = dpct::dp4a(w.v[5], a.u[1].y(), sumi);
+        sumi = dpct::dp4a(w.v[6], a.u[1].z(), sumi);
+        sumi = dpct::dp4a(w.v[7], a.u[1].w(), sumi);
+        return w.d * a.d8 * sumi;
+    }
+
     static __dpct_inline__ float dot32(const weights & w, const int8_t * q8, const sycl::half2 ds8) {
         const int * u     = (const int *) q8;
         int         sumi1 = 0;
@@ -2039,6 +2116,18 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_NL> : reorder_vec_dot_iq
         return decode(base + ibx_offset.first, *reinterpret_cast<const ggml_half *>(base + d_offset.first));
     }
 
+    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                        const std::pair<int, int> d_offset, const int & /* iqs */,
+                                        const uint32_t * table) {
+        const uint8_t * base = static_cast<const uint8_t *>(vbq);
+        return decode(base + ibx_offset.first, *reinterpret_cast<const ggml_half *>(base + d_offset.first), table);
+    }
+
+    __dpct_inline__ static activations load_activations(const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
+                                                        const int & /* iqs */) {
+        return load_activations32(q8_1_quant_ptr, *q8_1_ds);
+    }
+
     __dpct_inline__ static float dot(const weights & w, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
                                      const int & /* iqs */) {
         return dot32(w, q8_1_quant_ptr, *q8_1_ds);
@@ -2055,10 +2144,8 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS> : reorder_vec_dot_iq
     static constexpr ggml_type gtype = GGML_TYPE_IQ4_XS;
 
     // iqs is the first qs int of the lane's sub-block
-    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
-                                        const std::pair<int, int> d_offset, const int & iqs) {
-        const uint8_t * base     = static_cast<const uint8_t *>(vbq);
-        const int       ib32     = iqs / 4;
+    __dpct_inline__ static float scale(const uint8_t * base, const std::pair<int, int> d_offset, const int & iqs) {
+        const int ib32 = iqs / 4;
         // the 8-byte {d, scales_h, scales_l} record in one load
         static_assert(offsetof(block_iq4_xs, qs) == 8 && offsetof(block_iq4_xs, scales_l) == 4);
         const sycl::uint2 meta     = *reinterpret_cast<const sycl::uint2 *>(base + d_offset.first);
@@ -2066,7 +2153,25 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS> : reorder_vec_dot_iq
         const uint32_t    scales_h = meta.x() >> (16 + 2 * ib32);
         const int         ls       = (scales_l & 0xf) | ((scales_h & 3) << 4);
         const float       d        = (float) sycl::bit_cast<sycl::half>((uint16_t) meta.x());
-        return decode(base + ibx_offset.first + sizeof(int) * iqs, d * (ls - 32));
+        return d * (ls - 32);
+    }
+
+    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                        const std::pair<int, int> d_offset, const int & iqs) {
+        const uint8_t * base = static_cast<const uint8_t *>(vbq);
+        return decode(base + ibx_offset.first + sizeof(int) * iqs, scale(base, d_offset, iqs));
+    }
+
+    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                        const std::pair<int, int> d_offset, const int & iqs,
+                                        const uint32_t * table) {
+        const uint8_t * base = static_cast<const uint8_t *>(vbq);
+        return decode(base + ibx_offset.first + sizeof(int) * iqs, scale(base, d_offset, iqs), table);
+    }
+
+    __dpct_inline__ static activations load_activations(const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
+                                                        const int & iqs) {
+        return load_activations32(q8_1_quant_ptr + (iqs / 4) * QK8_1, q8_1_ds[iqs / 4]);
     }
 
     __dpct_inline__ static float dot(const weights & w, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,

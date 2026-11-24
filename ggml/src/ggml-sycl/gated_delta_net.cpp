@@ -111,6 +111,9 @@ void gated_delta_net_sycl(const float *     q,
                           int64_t           sq1,
                           int64_t           sq2,
                           int64_t           sq3,
+                          int64_t           sk1,
+                          int64_t           sk2,
+                          int64_t           sk3,
                           int64_t           sv1,
                           int64_t           sv2,
                           int64_t           sv3,
@@ -231,7 +234,7 @@ void gated_delta_net_sycl(const float *     q,
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
     const float * qp = q + iq3 * sq3 + iq1 * sq1 + lane;
-    const float * kp = k + iq3 * sq3 + iq1 * sq1 + lane;
+    const float * kp = k + iq3 * sk3 + iq1 * sk1 + lane;
     const float * vp = v + sequence * sv3 + h_idx * sv1 + col0;
     const float * bp = beta + sequence * sb3 + h_idx * sb1;
     const float * gp = g + (sequence * sb3 + h_idx * sb1) * (KDA ? S_v : 1);
@@ -260,7 +263,7 @@ void gated_delta_net_sycl(const float *     q,
         }
         if (t + 1 < n_tokens) {
             qp += sq2;
-            kp += sq2;
+            kp += sk2;
         }
         // Load outside the branch: the last token reads its own row again.
         // A guarded load is 20% slower at 32 heads on Arc Pro B70.
@@ -423,6 +426,9 @@ static void launch_gated_delta_net(const float *   q_d,
                                    int64_t         sq1,
                                    int64_t         sq2,
                                    int64_t         sq3,
+                                   int64_t         sk1,
+                                   int64_t         sk2,
+                                   int64_t         sk3,
                                    int64_t         sv1,
                                    int64_t         sv2,
                                    int64_t         sv3,
@@ -450,7 +456,7 @@ static void launch_gated_delta_net(const float *   q_d,
         stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                              [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                  gated_delta_net_sycl<sv, C, KDA, keep_rs_t, replay>(
-                                     q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2,
+                                     q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sk1, sk2, sk3, sv1, sv2,
                                      sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, rep);
                              });
     };
@@ -516,7 +522,6 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
-    GGML_ASSERT(ggml_are_same_stride(src_q, src_k));
     GGML_ASSERT(src_g->ne[0] == 1 || kda);
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
@@ -526,6 +531,10 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     const int64_t sq1 = nbq1 / sizeof(float);
     const int64_t sq2 = nbq2 / sizeof(float);
     const int64_t sq3 = nbq3 / sizeof(float);
+    // k can have its own layout (a permuted or padded view), only its rows must be contiguous
+    const int64_t sk1 = nbk1 / sizeof(float);
+    const int64_t sk2 = nbk2 / sizeof(float);
+    const int64_t sk3 = nbk3 / sizeof(float);
     const int64_t sv1 = nbv1 / sizeof(float);
     const int64_t sv2 = nbv2 / sizeof(float);
     const int64_t sv3 = nbv3 / sizeof(float);
@@ -596,7 +605,7 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
 
 #define GDN_LAUNCH(KDA, KEEP, REPLAY)                                                                  \
     launch_gated_delta_net<KDA, KEEP, REPLAY>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, \
-                                              n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,  \
+                                              n_seqs, sq1, sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,  \
                                               scale, state_slot_stride, K, rep, stream)
 
     if (kda) {

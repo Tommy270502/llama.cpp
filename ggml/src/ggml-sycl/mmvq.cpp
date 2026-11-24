@@ -1,4 +1,14 @@
 #include "mmvq.hpp"
+#include "mmvq-codebook.hpp"
+
+// GGML_SYCL_CODEBOOK_MMVQ=0 goes back to the per-type IQ1/IQ2/IQ3 kernels
+static bool ggml_sycl_codebook_mmvq_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_SYCL_CODEBOOK_MMVQ");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
 
 #include "ggml.h"
 #include "common.hpp"
@@ -2365,6 +2375,17 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the kernel writes into
 
+    if (ggml_sycl_codebook_type(src0->type) && ggml_sycl_codebook_mmvq_enabled() && src1_ncols <= 8) {
+        const auto * extra     = (const ggml_tensor_extra_gpu *) src0->extra;
+        const bool   reordered = extra && extra->optimized_feature.reorder;
+        GGML_SYCL_DEBUG("Calling codebook MMVQ type=%s reordered=%d ncols=%d\n", ggml_type_name(src0->type),
+                        (int) reordered, (int) src1_ncols);
+        if (ggml_sycl_mul_mat_vec_codebook(src0->type, reordered, src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                                           src1_ncols, src1_padded_col_size * q8_1_ts / q8_1_bs, dst->ne[0], stream)) {
+            return;
+        }
+    }
+
     for (int i = 0; i < src1_ncols; i++) {
         const size_t src1_ddq_i_offset = i * src1_padded_col_size * q8_1_ts / q8_1_bs;
         const char * src1_ddq_i_bs     = src1_ddq_i + src1_ddq_i_offset;
@@ -2934,6 +2955,11 @@ bool ggml_sycl_mul_mat_vec_q_id(
     dpct::queue_ptr    stream) {
     if (!ggml_sycl_mul_mat_vec_q_id_supports_type(src0_type)) {
         return false;
+    }
+    if (ggml_sycl_codebook_type(src0_type) && ggml_sycl_codebook_mmvq_enabled() &&
+        ggml_sycl_mul_mat_vec_codebook_id(src0_type, vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                                          expert_weight_stride, dst_row_stride, src1_row_stride, stream)) {
+        return true;
     }
     switch (src0_type) {
         case GGML_TYPE_Q4_0:

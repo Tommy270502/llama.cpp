@@ -164,6 +164,34 @@ static __dpct_inline__ int mxfp4_codes_to_int8(const uint32_t x) {
     return (int) ((mag ^ (neg * 0xffu)) + neg);
 }
 
+// Four IQ4_NL codes (bits 0..3 of each byte) to their kvalues_iq4nl int8 values, as a mux tree over the
+// code bits in registers. On Intel GPUs the table lookups of get_int_from_table_16 are byte gathers.
+static __dpct_inline__ int iq4nl_codes_to_int8(const uint32_t x) {
+    constexpr int8_t kv[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+
+    uint32_t m[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t b = (x >> i) & 0x01010101u;
+        m[i] = (b << 8) - b;
+    }
+
+    uint32_t v[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        v[i] = (uint32_t) (uint8_t) kv[i] * 0x01010101u;
+    }
+
+#pragma unroll
+    for (int l = 0, n = 16; l < 4; ++l, n /= 2) {
+#pragma unroll
+        for (int i = 0; i < n / 2; ++i) {
+            v[i] = v[2 * i] ^ ((v[2 * i] ^ v[2 * i + 1]) & m[l]);
+        }
+    }
+    return (int) v[0];
+}
+
 // Same result as get_int_from_table_16(q4, kvalues_mxfp4): x = low nibbles, y = high nibbles.
 static __dpct_inline__ sycl::int2 get_int_from_mxfp4(const int q4) {
     return sycl::int2(mxfp4_codes_to_int8((uint32_t) q4 & 0x0f0f0f0fu),
@@ -1973,14 +2001,17 @@ struct reorder_vec_dot_iq4_32 {
     };
 
     static __dpct_inline__ weights decode(const uint8_t * qs, const float d) {
-        const sycl::int4 q4     = *reinterpret_cast<const sycl::int4 *>(qs);
-        const uint8_t *  values = (const uint8_t *) kvalues_iq4nl;
+        const sycl::int4 q4 = *reinterpret_cast<const sycl::int4 *>(qs);
 
         weights w;
-        get_int_from_table_16((uint32_t) q4.x(), values, w.v[0], w.v[4]);
-        get_int_from_table_16((uint32_t) q4.y(), values, w.v[1], w.v[5]);
-        get_int_from_table_16((uint32_t) q4.z(), values, w.v[2], w.v[6]);
-        get_int_from_table_16((uint32_t) q4.w(), values, w.v[3], w.v[7]);
+        w.v[0] = iq4nl_codes_to_int8((uint32_t) q4.x());
+        w.v[4] = iq4nl_codes_to_int8((uint32_t) q4.x() >> 4);
+        w.v[1] = iq4nl_codes_to_int8((uint32_t) q4.y());
+        w.v[5] = iq4nl_codes_to_int8((uint32_t) q4.y() >> 4);
+        w.v[2] = iq4nl_codes_to_int8((uint32_t) q4.z());
+        w.v[6] = iq4nl_codes_to_int8((uint32_t) q4.z() >> 4);
+        w.v[3] = iq4nl_codes_to_int8((uint32_t) q4.w());
+        w.v[7] = iq4nl_codes_to_int8((uint32_t) q4.w() >> 4);
         w.d = d;
         return w;
     }
@@ -2027,12 +2058,14 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS> : reorder_vec_dot_iq
     __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
                                         const std::pair<int, int> d_offset, const int & iqs) {
         const uint8_t * base     = static_cast<const uint8_t *>(vbq);
-        const uint8_t * meta     = base + d_offset.first;
         const int       ib32     = iqs / 4;
-        const uint16_t  scales_h = *reinterpret_cast<const uint16_t *>(meta + offsetof(block_iq4_xs, scales_h));
-        const uint8_t   scales_l = meta[offsetof(block_iq4_xs, scales_l) + ib32 / 2];
-        const int       ls       = ((scales_l >> (4 * (ib32 % 2))) & 0xf) | (((scales_h >> (2 * ib32)) & 3) << 4);
-        const float     d        = (float) *reinterpret_cast<const ggml_half *>(meta + offsetof(block_iq4_xs, d));
+        // the 8-byte {d, scales_h, scales_l} record in one load
+        static_assert(offsetof(block_iq4_xs, qs) == 8 && offsetof(block_iq4_xs, scales_l) == 4);
+        const sycl::uint2 meta     = *reinterpret_cast<const sycl::uint2 *>(base + d_offset.first);
+        const uint32_t    scales_l = meta.y() >> (4 * ib32);
+        const uint32_t    scales_h = meta.x() >> (16 + 2 * ib32);
+        const int         ls       = (scales_l & 0xf) | ((scales_h & 3) << 4);
+        const float       d        = (float) sycl::bit_cast<sycl::half>((uint16_t) meta.x());
         return decode(base + ibx_offset.first + sizeof(int) * iqs, d * (ls - 32));
     }
 

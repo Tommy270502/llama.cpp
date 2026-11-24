@@ -5312,6 +5312,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
         use_mul_mat_q = can_use_mul_mat_q(src0, src1, dst);
 
+        // Q4_1 / Q5_0 / Q5_1 have no reordered kernels, and their MMVQ reads 2-4x faster than DMMV
+        if (use_mul_mat_vec_q && (src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q5_0 ||
+                                  src0->type == GGML_TYPE_Q5_1)) {
+            use_dequantize_mul_mat_vec = false;
+        }
+
         // When reorder is enabled, both ESIMD, MMVQ and DMMV kernels may be used. For
         // best performance use ESIMD when supported, followed by MMVQ, and finally DMMV.
         // But the reordered ESIMD path cannot be used without reordered MMVQ. A later

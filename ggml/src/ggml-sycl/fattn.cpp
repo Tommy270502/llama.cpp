@@ -129,7 +129,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     float logit_softcap = 0.0f;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // a mask per head (mask->ne[2] > 1) is read only by the VEC and TILE kernels, one head per column group
+    const bool mask_per_head = mask && mask->ne[2] > 1;
+
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && !mask_per_head && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
@@ -157,7 +160,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         V->ne[0] == 512 && gqa_ratio == 20 &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !mask_per_head && !sinks && gqa_ratio >= 2 &&
         (standard_shape || glm_mla_shape) &&
         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -240,10 +243,6 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
-    }
-
-    if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
     }
 
     // q4_0 / q8_0 K/V decode and small batches on Xe2: read the cache directly, no F16 copy of K and V

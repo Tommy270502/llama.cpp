@@ -7819,14 +7819,28 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-        case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
-        case GGML_OP_SUB:
         case GGML_OP_COUNT_EQUAL:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
         case GGML_OP_REPEAT:
             return true;
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+            {
+                // the type combinations ggml_sycl_op_bin_bcast implements
+                const ggml_type t0 = op->src[0]->type;
+                const ggml_type t1 = op->src[1]->type;
+                const ggml_type td = op->type;
+                if (t0 != td) {
+                    return false;
+                }
+                if (t1 == td) {
+                    return td == GGML_TYPE_F32 || td == GGML_TYPE_F16 || td == GGML_TYPE_BF16 ||
+                           td == GGML_TYPE_I32 || td == GGML_TYPE_I16;
+                }
+                return t1 == GGML_TYPE_F32 && (td == GGML_TYPE_F16 || td == GGML_TYPE_BF16 || td == GGML_TYPE_F8_E4M3);
+            }
         case GGML_OP_PAD_REFLECT_1D:
             return ggml_is_contiguous(op->src[0]) && op-> type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SQR:

@@ -235,7 +235,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
+            // the tile kernel for DKQ=576 only has the ncols2 = 4, 8 and 16 variants
+            if (!gqa_opt_applies || gqa_ratio % 4 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;

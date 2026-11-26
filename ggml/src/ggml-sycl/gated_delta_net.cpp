@@ -559,9 +559,9 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     }
 
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-    // the esimd kernel has no replay path
+    // the esimd kernel has no replay path and reads k with the q strides
     if (!kda && S_v == 128 && g_ggml_sycl_enable_esimd && state_slot_stride % 4 == 0 && (uintptr_t) state_d % 16 == 0 &&
-        dst->src[6] == nullptr) {
+        dst->src[6] == nullptr && sq1 == sk1 && sq2 == sk2 && sq3 == sk3) {
         launch_gated_delta_net_esimd(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3,
                                      sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         return;
